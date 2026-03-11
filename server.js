@@ -4,6 +4,7 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -61,6 +62,6 @@ app.post('/api/v1/chat', (req, res) => {
 // ============================================================
 // START SERVER
 // ============================================================
-app.listen(PORT, () => {
-  console.log(`Account AI service running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`Account AI service running on http://${HOST}:${PORT}`);
 });
