@@ -32,7 +32,7 @@ app.post('/api/v1/chat', async (req, res) => {
     const body = req.body || {};
 
     const userMessage = body.userMessage || 'No message provided';
-    const model = body.model || 'gpt-4.1';
+    const model = body.model || 'gpt-4.1-mini';
     const persona = body.persona || 'balanced';
     const context = body.context || {};
 
