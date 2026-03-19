@@ -21,6 +21,18 @@ app.get('/health', (_req, res) => {
   });
 });
 
+function normalizeModelName(model) {
+  const value = String(model || '').trim().toLowerCase();
+
+  if (!value) return 'gpt-4.1-mini';
+  if (value === 'gpt-4.1 mini' || value === 'gpt-4.1-mini') return 'gpt-4.1-mini';
+  if (value === 'gpt-4.1') return 'gpt-4.1';
+  if (value === 'gpt-4o mini' || value === 'gpt-4o-mini') return 'gpt-4o-mini';
+  if (value === 'gpt-4o') return 'gpt-4o';
+
+  return 'gpt-4.1-mini';
+}
+
 function buildSystemPrompt(persona) {
   return `
 You are a Salesforce AI Account Copilot.
@@ -199,17 +211,33 @@ function normalizeInsightPayload(parsed, objectApiName) {
   };
 }
 
-app.post('/analyze', async (req, res) => {
+async function withTimeout(promise, ms, label) {
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+  });
+
   try {
-    const body = req.body || {};
-    const objectApiName = body.objectApiName || 'UnknownObject';
-    const recordId = body.recordId || 'UnknownRecord';
-    const fields = body.fields || {};
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
-    const prompt = buildRecordInsightPrompt(objectApiName, recordId, fields);
+async function runRecordInsightAnalysis(body) {
+  const objectApiName = body.objectApiName || 'UnknownObject';
+  const recordId = body.recordId || 'UnknownRecord';
+  const fields = body.fields || {};
 
-    const response = await client.responses.create({
+  const prompt = buildRecordInsightPrompt(objectApiName, recordId, fields);
+
+  const response = await withTimeout(
+    client.responses.create({
       model: 'gpt-4.1-mini',
+      max_output_tokens: 300,
       input: [
         {
           role: 'system',
@@ -220,26 +248,47 @@ app.post('/analyze', async (req, res) => {
           content: prompt
         }
       ]
+    }),
+    15000,
+    'Analyze request'
+  );
+
+  const aiText = response.output_text || '';
+  const parsed = safeJsonParse(aiText);
+
+  if (!parsed) {
+    return {
+      summary: `AI analysis for ${objectApiName} completed, but the model did not return valid JSON. Raw output has been captured.`,
+      riskLevel: 'Medium',
+      recommendedAction: 'Review the AI output and retry if needed.',
+      shouldCreateTask: false,
+      taskSubject: `Review ${objectApiName} AI insight`,
+      taskDescription: aiText || 'No structured AI output returned.',
+      confidenceScore: 0.5
+    };
+  }
+
+  return normalizeInsightPayload(parsed, objectApiName);
+}
+
+app.post('/analyze', async (req, res) => {
+  try {
+    const result = await runRecordInsightAnalysis(req.body || {});
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error('AI Analyze Error:', error);
+
+    return res.status(500).json({
+      error: 'AI analysis failed',
+      message: error.message
     });
+  }
+});
 
-    const aiText = response.output_text || '';
-    const parsed = safeJsonParse(aiText);
-
-    if (!parsed) {
-      return res.status(200).json({
-        summary: `AI analysis for ${objectApiName} completed, but the model did not return valid JSON. Raw output has been captured.`,
-        riskLevel: 'Medium',
-        recommendedAction: 'Review the AI output and retry if needed.',
-        shouldCreateTask: false,
-        taskSubject: `Review ${objectApiName} AI insight`,
-        taskDescription: aiText || 'No structured AI output returned.',
-        confidenceScore: 0.5
-      });
-    }
-
-    return res.status(200).json(
-      normalizeInsightPayload(parsed, objectApiName)
-    );
+app.post('/api/v1/analyze', async (req, res) => {
+  try {
+    const result = await runRecordInsightAnalysis(req.body || {});
+    return res.status(200).json(result);
   } catch (error) {
     console.error('AI Analyze Error:', error);
 
@@ -254,30 +303,38 @@ app.post('/api/v1/chat', async (req, res) => {
   try {
     const body = req.body || {};
     const userMessage = body.userMessage || 'No message provided';
-    const model = body.model || 'gpt-4.1-mini';
+    const model = normalizeModelName(body.model);
     const persona = body.persona || 'balanced';
     const context = body.context || {};
 
-    const response = await client.responses.create({
-      model,
-      input: [
-        {
-          role: 'system',
-          content: buildSystemPrompt(persona)
-        },
-        {
-          role: 'user',
-          content: buildUserPrompt(userMessage, context)
-        }
-      ]
-    });
+    console.log('CHAT REQUEST MODEL:', body.model, '=>', model);
+    console.log('CHAT REQUEST PERSONA:', persona);
+
+    const response = await withTimeout(
+      client.responses.create({
+        model,
+        max_output_tokens: 500,
+        input: [
+          {
+            role: 'system',
+            content: buildSystemPrompt(persona)
+          },
+          {
+            role: 'user',
+            content: buildUserPrompt(userMessage, context)
+          }
+        ]
+      }),
+      20000,
+      'Chat request'
+    );
 
     const aiText = response.output_text || 'No response generated.';
     const citations = buildCitations(context);
 
     return res.status(200).json({
       response: aiText,
-      model: model,
+      model,
       cost: 0,
       tokenUsage: response.usage?.total_tokens || 0,
       confidence: 90,
@@ -287,7 +344,7 @@ app.post('/api/v1/chat', async (req, res) => {
         'Who are the key contacts on this account?',
         'Are there any contract renewal risks?'
       ],
-      citations: citations
+      citations
     });
   } catch (error) {
     console.error('AI Chat Error:', error);
