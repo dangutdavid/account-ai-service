@@ -21,6 +21,27 @@ app.get('/health', (_req, res) => {
   });
 });
 
+function normalizeModelName(model) {
+  const value = String(model || '').trim().toLowerCase();
+
+  if (!value) return 'gpt-4.1-mini';
+
+  if (value === 'gpt-4.1 mini' || value === 'gpt-4.1-mini') {
+    return 'gpt-4.1-mini';
+  }
+  if (value === 'gpt-4.1') {
+    return 'gpt-4.1';
+  }
+  if (value === 'gpt-4o mini' || value === 'gpt-4o-mini') {
+    return 'gpt-4o-mini';
+  }
+  if (value === 'gpt-4o') {
+    return 'gpt-4o';
+  }
+
+  return 'gpt-4.1-mini';
+}
+
 function buildSystemPrompt(persona) {
   return `
 You are a Salesforce AI Account Copilot.
@@ -237,9 +258,7 @@ app.post('/analyze', async (req, res) => {
       });
     }
 
-    return res.status(200).json(
-      normalizeInsightPayload(parsed, objectApiName)
-    );
+    return res.status(200).json(normalizeInsightPayload(parsed, objectApiName));
   } catch (error) {
     console.error('AI Analyze Error:', error);
 
@@ -254,9 +273,12 @@ app.post('/api/v1/chat', async (req, res) => {
   try {
     const body = req.body || {};
     const userMessage = body.userMessage || 'No message provided';
-    const model = body.model || 'gpt-4.1-mini';
+    const model = normalizeModelName(body.model);
     const persona = body.persona || 'balanced';
     const context = body.context || {};
+
+    console.log('CHAT REQUEST MODEL:', body.model, '=>', model);
+    console.log('CHAT REQUEST PERSONA:', persona);
 
     const response = await client.responses.create({
       model,
@@ -277,7 +299,7 @@ app.post('/api/v1/chat', async (req, res) => {
 
     return res.status(200).json({
       response: aiText,
-      model: model,
+      model,
       cost: 0,
       tokenUsage: response.usage?.total_tokens || 0,
       confidence: 90,
@@ -287,7 +309,7 @@ app.post('/api/v1/chat', async (req, res) => {
         'Who are the key contacts on this account?',
         'Are there any contract renewal risks?'
       ],
-      citations: citations
+      citations
     });
   } catch (error) {
     console.error('AI Chat Error:', error);
