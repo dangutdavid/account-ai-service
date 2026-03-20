@@ -82,6 +82,79 @@ async function withTimeout(promise, ms, label) {
 }
 
 // ======================================================
+// FRIENDLY ERROR HELPERS
+// ======================================================
+function stringifyError(error) {
+  if (!error) return 'Unknown error';
+
+  if (typeof error === 'string') return error;
+
+  if (error.message && typeof error.message === 'string') {
+    return error.message;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch (_e) {
+    return 'Unknown error';
+  }
+}
+
+function getProviderFromModel(model) {
+  return String(model || '').startsWith('claude') ? 'Anthropic' : 'OpenAI';
+}
+
+function isAnthropicLowCreditError(error) {
+  const text = stringifyError(error).toLowerCase();
+  return (
+    text.includes('credit balance is too low') ||
+    text.includes('please go to plans & billing') ||
+    text.includes('anthropic api')
+  );
+}
+
+function isOpenAILowCreditError(error) {
+  const text = stringifyError(error).toLowerCase();
+  return (
+    text.includes('insufficient_quota') ||
+    text.includes('quota') ||
+    text.includes('billing') ||
+    text.includes('exceeded your current quota') ||
+    text.includes('check your plan and billing') ||
+    text.includes('rate limit reached for requests') && text.includes('billing')
+  );
+}
+
+function getFriendlyProviderError(error, model) {
+  const provider = getProviderFromModel(model);
+  const rawMessage = stringifyError(error);
+
+  if (provider === 'Anthropic' && isAnthropicLowCreditError(error)) {
+    return {
+      provider,
+      code: 'LOW_CREDIT',
+      message:
+        'Anthropic credit is too low for Claude requests. Please top up Anthropic billing or switch to an OpenAI model.'
+    };
+  }
+
+  if (provider === 'OpenAI' && isOpenAILowCreditError(error)) {
+    return {
+      provider,
+      code: 'LOW_CREDIT',
+      message:
+        'OpenAI credit or quota is too low for this request. Please check OpenAI billing/usage or switch to another configured provider.'
+    };
+  }
+
+  return {
+    provider,
+    code: 'PROVIDER_ERROR',
+    message: rawMessage
+  };
+}
+
+// ======================================================
 // PROMPT BUILDERS
 // ======================================================
 function buildSystemPrompt(persona) {
@@ -275,33 +348,42 @@ async function callClaudeChat({ model, persona, userMessage, context }) {
 
   const claudeModel = mapClaudeModel(model);
 
-  const response = await withTimeout(
-    anthropic.messages.create({
-      model: claudeModel,
-      max_tokens: 500,
-      messages: [
-        {
-          role: 'user',
-          content: `
+  try {
+    const response = await withTimeout(
+      anthropic.messages.create({
+        model: claudeModel,
+        max_tokens: 500,
+        messages: [
+          {
+            role: 'user',
+            content: `
 ${buildSystemPrompt(persona)}
 
 ${buildUserPrompt(userMessage, context)}
 `
-        }
-      ]
-    }),
-    20000,
-    'Claude chat request'
-  );
+          }
+        ]
+      }),
+      20000,
+      'Claude chat request'
+    );
 
-  const text = response.content?.[0]?.text || 'No response generated.';
+    const text = response.content?.[0]?.text || 'No response generated.';
 
-  return {
-    text,
-    tokenUsage:
-      (response.usage?.input_tokens || 0) +
-      (response.usage?.output_tokens || 0)
-  };
+    return {
+      text,
+      tokenUsage:
+        (response.usage?.input_tokens || 0) +
+        (response.usage?.output_tokens || 0)
+    };
+  } catch (error) {
+    const friendly = getFriendlyProviderError(error, model);
+    const wrapped = new Error(friendly.message);
+    wrapped.provider = friendly.provider;
+    wrapped.code = friendly.code;
+    wrapped.originalMessage = stringifyError(error);
+    throw wrapped;
+  }
 }
 
 // ======================================================
@@ -314,41 +396,50 @@ async function runRecordInsightAnalysis(body) {
 
   const prompt = buildRecordInsightPrompt(objectApiName, recordId, fields);
 
-  const response = await withTimeout(
-    client.responses.create({
-      model: 'gpt-4.1-mini',
-      max_output_tokens: 300,
-      input: [
-        {
-          role: 'system',
-          content: 'You analyze Salesforce records and return strict JSON only.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ]
-    }),
-    15000,
-    'Analyze request'
-  );
+  try {
+    const response = await withTimeout(
+      client.responses.create({
+        model: 'gpt-4.1-mini',
+        max_output_tokens: 300,
+        input: [
+          {
+            role: 'system',
+            content: 'You analyze Salesforce records and return strict JSON only.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ]
+      }),
+      15000,
+      'Analyze request'
+    );
 
-  const aiText = response.output_text || '';
-  const parsed = safeJsonParse(aiText);
+    const aiText = response.output_text || '';
+    const parsed = safeJsonParse(aiText);
 
-  if (!parsed) {
-    return {
-      summary: `AI analysis for ${objectApiName} completed, but the model did not return valid JSON. Raw output has been captured.`,
-      riskLevel: 'Medium',
-      recommendedAction: 'Review the AI output and retry if needed.',
-      shouldCreateTask: false,
-      taskSubject: `Review ${objectApiName} AI insight`,
-      taskDescription: aiText || 'No structured AI output returned.',
-      confidenceScore: 0.5
-    };
+    if (!parsed) {
+      return {
+        summary: `AI analysis for ${objectApiName} completed, but the model did not return valid JSON. Raw output has been captured.`,
+        riskLevel: 'Medium',
+        recommendedAction: 'Review the AI output and retry if needed.',
+        shouldCreateTask: false,
+        taskSubject: `Review ${objectApiName} AI insight`,
+        taskDescription: aiText || 'No structured AI output returned.',
+        confidenceScore: 0.5
+      };
+    }
+
+    return normalizeInsightPayload(parsed, objectApiName);
+  } catch (error) {
+    const friendly = getFriendlyProviderError(error, 'gpt-4.1-mini');
+    const wrapped = new Error(friendly.message);
+    wrapped.provider = friendly.provider;
+    wrapped.code = friendly.code;
+    wrapped.originalMessage = stringifyError(error);
+    throw wrapped;
   }
-
-  return normalizeInsightPayload(parsed, objectApiName);
 }
 
 // ======================================================
@@ -363,7 +454,10 @@ app.post('/analyze', async (req, res) => {
 
     return res.status(500).json({
       error: 'AI analysis failed',
-      message: error.message
+      provider: error.provider || 'OpenAI',
+      code: error.code || 'PROVIDER_ERROR',
+      message: error.message,
+      details: error.originalMessage || error.message
     });
   }
 });
@@ -377,7 +471,10 @@ app.post('/api/v1/analyze', async (req, res) => {
 
     return res.status(500).json({
       error: 'AI analysis failed',
-      message: error.message
+      provider: error.provider || 'OpenAI',
+      code: error.code || 'PROVIDER_ERROR',
+      message: error.message,
+      details: error.originalMessage || error.message
     });
   }
 });
@@ -405,29 +502,38 @@ app.post('/api/v1/chat', async (req, res) => {
         context
       });
     } else {
-      const response = await withTimeout(
-        client.responses.create({
-          model,
-          max_output_tokens: 500,
-          input: [
-            {
-              role: 'system',
-              content: buildSystemPrompt(persona)
-            },
-            {
-              role: 'user',
-              content: buildUserPrompt(userMessage, context)
-            }
-          ]
-        }),
-        20000,
-        'OpenAI chat request'
-      );
+      try {
+        const response = await withTimeout(
+          client.responses.create({
+            model,
+            max_output_tokens: 500,
+            input: [
+              {
+                role: 'system',
+                content: buildSystemPrompt(persona)
+              },
+              {
+                role: 'user',
+                content: buildUserPrompt(userMessage, context)
+              }
+            ]
+          }),
+          20000,
+          'OpenAI chat request'
+        );
 
-      aiResult = {
-        text: response.output_text || 'No response generated.',
-        tokenUsage: response.usage?.total_tokens || 0
-      };
+        aiResult = {
+          text: response.output_text || 'No response generated.',
+          tokenUsage: response.usage?.total_tokens || 0
+        };
+      } catch (error) {
+        const friendly = getFriendlyProviderError(error, model);
+        const wrapped = new Error(friendly.message);
+        wrapped.provider = friendly.provider;
+        wrapped.code = friendly.code;
+        wrapped.originalMessage = stringifyError(error);
+        throw wrapped;
+      }
     }
 
     const citations = buildCitations(context);
@@ -451,7 +557,10 @@ app.post('/api/v1/chat', async (req, res) => {
 
     return res.status(500).json({
       error: 'AI service failed',
-      message: error.message
+      provider: error.provider || getProviderFromModel(normalizeModelName(req.body?.model)),
+      code: error.code || 'PROVIDER_ERROR',
+      message: error.message,
+      details: error.originalMessage || error.message
     });
   }
 });
