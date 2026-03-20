@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const OpenAI = require('openai');
-const Anthropic = require('@anthropic-ai/sdk'); // ✅ ADD THIS
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,9 +12,9 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-const anthropic = new Anthropic({ // ✅ ADD THIS
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -22,7 +22,9 @@ app.use(express.json({ limit: '2mb' }));
 app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'ok',
-    message: 'Account AI service is running'
+    message: 'Account AI service is running',
+    openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
+    anthropicConfigured: Boolean(process.env.ANTHROPIC_API_KEY)
   });
 });
 
@@ -40,7 +42,7 @@ function normalizeModelName(model) {
   if (value === 'gpt-4o mini' || value === 'gpt-4o-mini') return 'gpt-4o-mini';
   if (value === 'gpt-4o') return 'gpt-4o';
 
-  // ✅ ADD Claude support
+  // Claude
   if (value === 'claude-sonnet-4') return 'claude-sonnet-4';
   if (value.startsWith('claude')) return value;
 
@@ -51,13 +53,32 @@ function normalizeModelName(model) {
 // CLAUDE MODEL MAPPING
 // ======================================================
 function mapClaudeModel(model) {
-  const value = String(model || '').toLowerCase();
+  const value = String(model || '').trim().toLowerCase();
 
   if (value === 'claude-sonnet-4') {
     return 'claude-3-7-sonnet-latest';
   }
 
   return value;
+}
+
+// ======================================================
+// TIMEOUT WRAPPER
+// ======================================================
+async function withTimeout(promise, ms, label) {
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ======================================================
@@ -98,40 +119,86 @@ ${JSON.stringify(context, null, 2)}
 `;
 }
 
-// ======================================================
-// CLAUDE CHAT CALL
-// ======================================================
-async function callClaudeChat({ model, persona, userMessage, context }) {
-  const claudeModel = mapClaudeModel(model);
+function buildRecordInsightPrompt(objectApiName, recordId, fields) {
+  return `
+You are a Salesforce AI Record Intelligence assistant.
 
-  const response = await anthropic.messages.create({
-    model: claudeModel,
-    max_tokens: 500,
-    messages: [
-      {
-        role: 'user',
-        content: `
-${buildSystemPrompt(persona)}
+Your task is to analyze a single Salesforce record and return business insight.
 
-${buildUserPrompt(userMessage, context)}
-`
-      }
-    ]
-  });
+Object API Name: ${objectApiName}
+Record Id: ${recordId}
 
-  const text = response.content?.[0]?.text || 'No response generated.';
+Record Fields:
+${JSON.stringify(fields, null, 2)}
 
-  return {
-    text,
-    tokenUsage:
-      (response.usage?.input_tokens || 0) +
-      (response.usage?.output_tokens || 0)
-  };
+Return ONLY valid JSON with this exact shape:
+{
+  "summary": "short business summary",
+  "riskLevel": "Low | Medium | High | Critical",
+  "recommendedAction": "clear next best action",
+  "shouldCreateTask": true,
+  "taskSubject": "short task subject",
+  "taskDescription": "task details",
+  "confidenceScore": 0.85
+}
+
+Rules:
+- Do not include markdown fences.
+- Do not include commentary outside JSON.
+- Base the answer only on supplied fields.
+- If data is limited, say so in the summary.
+- riskLevel must be exactly one of: Low, Medium, High, Critical.
+- confidenceScore must be a number between 0 and 1.
+`;
 }
 
 // ======================================================
-// CITATIONS
+// HELPERS
 // ======================================================
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_e) {
+    return null;
+  }
+}
+
+function normalizeRiskLevel(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'low') return 'Low';
+  if (text === 'medium' || text === 'moderate') return 'Medium';
+  if (text === 'high') return 'High';
+  if (text === 'critical') return 'Critical';
+  return 'Medium';
+}
+
+function normalizeConfidenceScore(value) {
+  const num = Number(value);
+  if (Number.isNaN(num)) return 0.7;
+  if (num < 0) return 0;
+  if (num > 1) return 1;
+  return num;
+}
+
+function normalizeInsightPayload(parsed, objectApiName) {
+  return {
+    summary:
+      parsed?.summary ||
+      `AI analysis completed for ${objectApiName}, but limited structured detail was returned.`,
+    riskLevel: normalizeRiskLevel(parsed?.riskLevel),
+    recommendedAction:
+      parsed?.recommendedAction ||
+      'Review the record and determine the next best action.',
+    shouldCreateTask: Boolean(parsed?.shouldCreateTask),
+    taskSubject:
+      parsed?.taskSubject || `Review ${objectApiName} AI insight`,
+    taskDescription:
+      parsed?.taskDescription ||
+      'AI flagged this record for review. Please inspect the summary and decide the next step.',
+    confidenceScore: normalizeConfidenceScore(parsed?.confidenceScore)
+  };
+}
+
 function buildCitations(context) {
   const citations = [];
 
@@ -199,6 +266,123 @@ function buildCitations(context) {
 }
 
 // ======================================================
+// CLAUDE CHAT CALL
+// ======================================================
+async function callClaudeChat({ model, persona, userMessage, context }) {
+  if (!anthropic) {
+    throw new Error('Claude support is not configured. Missing ANTHROPIC_API_KEY.');
+  }
+
+  const claudeModel = mapClaudeModel(model);
+
+  const response = await withTimeout(
+    anthropic.messages.create({
+      model: claudeModel,
+      max_tokens: 500,
+      messages: [
+        {
+          role: 'user',
+          content: `
+${buildSystemPrompt(persona)}
+
+${buildUserPrompt(userMessage, context)}
+`
+        }
+      ]
+    }),
+    20000,
+    'Claude chat request'
+  );
+
+  const text = response.content?.[0]?.text || 'No response generated.';
+
+  return {
+    text,
+    tokenUsage:
+      (response.usage?.input_tokens || 0) +
+      (response.usage?.output_tokens || 0)
+  };
+}
+
+// ======================================================
+// RECORD INSIGHT ANALYSIS
+// ======================================================
+async function runRecordInsightAnalysis(body) {
+  const objectApiName = body.objectApiName || 'UnknownObject';
+  const recordId = body.recordId || 'UnknownRecord';
+  const fields = body.fields || {};
+
+  const prompt = buildRecordInsightPrompt(objectApiName, recordId, fields);
+
+  const response = await withTimeout(
+    client.responses.create({
+      model: 'gpt-4.1-mini',
+      max_output_tokens: 300,
+      input: [
+        {
+          role: 'system',
+          content: 'You analyze Salesforce records and return strict JSON only.'
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ]
+    }),
+    15000,
+    'Analyze request'
+  );
+
+  const aiText = response.output_text || '';
+  const parsed = safeJsonParse(aiText);
+
+  if (!parsed) {
+    return {
+      summary: `AI analysis for ${objectApiName} completed, but the model did not return valid JSON. Raw output has been captured.`,
+      riskLevel: 'Medium',
+      recommendedAction: 'Review the AI output and retry if needed.',
+      shouldCreateTask: false,
+      taskSubject: `Review ${objectApiName} AI insight`,
+      taskDescription: aiText || 'No structured AI output returned.',
+      confidenceScore: 0.5
+    };
+  }
+
+  return normalizeInsightPayload(parsed, objectApiName);
+}
+
+// ======================================================
+// ANALYZE ENDPOINTS
+// ======================================================
+app.post('/analyze', async (req, res) => {
+  try {
+    const result = await runRecordInsightAnalysis(req.body || {});
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error('AI Analyze Error:', error);
+
+    return res.status(500).json({
+      error: 'AI analysis failed',
+      message: error.message
+    });
+  }
+});
+
+app.post('/api/v1/analyze', async (req, res) => {
+  try {
+    const result = await runRecordInsightAnalysis(req.body || {});
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error('AI Analyze Error:', error);
+
+    return res.status(500).json({
+      error: 'AI analysis failed',
+      message: error.message
+    });
+  }
+});
+
+// ======================================================
 // CHAT ENDPOINT
 // ======================================================
 app.post('/api/v1/chat', async (req, res) => {
@@ -213,7 +397,6 @@ app.post('/api/v1/chat', async (req, res) => {
 
     let aiResult;
 
-    // ✅ ROUTING
     if (model.startsWith('claude')) {
       aiResult = await callClaudeChat({
         model,
@@ -222,20 +405,24 @@ app.post('/api/v1/chat', async (req, res) => {
         context
       });
     } else {
-      const response = await client.responses.create({
-        model,
-        max_output_tokens: 500,
-        input: [
-          {
-            role: 'system',
-            content: buildSystemPrompt(persona)
-          },
-          {
-            role: 'user',
-            content: buildUserPrompt(userMessage, context)
-          }
-        ]
-      });
+      const response = await withTimeout(
+        client.responses.create({
+          model,
+          max_output_tokens: 500,
+          input: [
+            {
+              role: 'system',
+              content: buildSystemPrompt(persona)
+            },
+            {
+              role: 'user',
+              content: buildUserPrompt(userMessage, context)
+            }
+          ]
+        }),
+        20000,
+        'OpenAI chat request'
+      );
 
       aiResult = {
         text: response.output_text || 'No response generated.',
