@@ -44,10 +44,14 @@ function normalizeModelName(model) {
 
   // Claude
   if (value === 'claude sonnet 4' || value === 'claude-sonnet-4') return 'claude-sonnet-4';
+  if (value === 'claude sonnet 4.6' || value === 'claude-sonnet-4.6' || value === 'claude-sonnet-4-6') {
+    return 'claude-sonnet-4-6';
+  }
   if (value.startsWith('claude')) return value;
 
   return 'gpt-4.1-mini';
 }
+
 
 // ======================================================
 // PROVIDER HELPERS
@@ -59,8 +63,17 @@ function getProviderFromModel(model) {
 function mapClaudeModel(model) {
   const value = String(model || '').trim().toLowerCase();
 
+  // Friendly dropdown value -> real Anthropic API model
   if (value === 'claude-sonnet-4') {
-    return 'claude-3-7-sonnet-latest';
+    return 'claude-sonnet-4-6';
+  }
+
+  if (value === 'claude-sonnet-4.6') {
+    return 'claude-sonnet-4-6';
+  }
+
+  if (value === 'claude-sonnet-4-6') {
+    return 'claude-sonnet-4-6';
   }
 
   return value;
