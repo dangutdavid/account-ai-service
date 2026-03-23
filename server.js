@@ -43,15 +43,19 @@ function normalizeModelName(model) {
   if (value === 'gpt-4o') return 'gpt-4o';
 
   // Claude
-  if (value === 'claude-sonnet-4') return 'claude-sonnet-4';
+  if (value === 'claude sonnet 4' || value === 'claude-sonnet-4') return 'claude-sonnet-4';
   if (value.startsWith('claude')) return value;
 
   return 'gpt-4.1-mini';
 }
 
 // ======================================================
-// CLAUDE MODEL MAPPING
+// PROVIDER HELPERS
 // ======================================================
+function getProviderFromModel(model) {
+  return String(model || '').startsWith('claude') ? 'Anthropic' : 'OpenAI';
+}
+
 function mapClaudeModel(model) {
   const value = String(model || '').trim().toLowerCase();
 
@@ -82,7 +86,7 @@ async function withTimeout(promise, ms, label) {
 }
 
 // ======================================================
-// FRIENDLY ERROR HELPERS
+// ERROR HELPERS
 // ======================================================
 function stringifyError(error) {
   if (!error) return 'Unknown error';
@@ -100,10 +104,6 @@ function stringifyError(error) {
   }
 }
 
-function getProviderFromModel(model) {
-  return String(model || '').startsWith('claude') ? 'Anthropic' : 'OpenAI';
-}
-
 function isAnthropicLowCreditError(error) {
   const text = stringifyError(error).toLowerCase();
   return (
@@ -117,24 +117,25 @@ function isOpenAILowCreditError(error) {
   const text = stringifyError(error).toLowerCase();
   return (
     text.includes('insufficient_quota') ||
+    text.includes('exceeded your current quota') ||
     text.includes('quota') ||
     text.includes('billing') ||
-    text.includes('exceeded your current quota') ||
-    text.includes('check your plan and billing') ||
-    text.includes('rate limit reached for requests') && text.includes('billing')
+    text.includes('check your plan and billing')
   );
 }
 
-function getFriendlyProviderError(error, model) {
+function classifyError(error, model) {
   const provider = getProviderFromModel(model);
-  const rawMessage = stringifyError(error);
+  const raw = stringifyError(error);
+  const text = raw.toLowerCase();
 
   if (provider === 'Anthropic' && isAnthropicLowCreditError(error)) {
     return {
       provider,
       code: 'LOW_CREDIT',
       message:
-        'Anthropic credit is too low for Claude requests. Please top up Anthropic billing or switch to an OpenAI model.'
+        'Anthropic credit is too low. Please top up Anthropic billing or switch to an OpenAI model.',
+      details: raw
     };
   }
 
@@ -143,14 +144,34 @@ function getFriendlyProviderError(error, model) {
       provider,
       code: 'LOW_CREDIT',
       message:
-        'OpenAI credit or quota is too low for this request. Please check OpenAI billing/usage or switch to another configured provider.'
+        'OpenAI credit or quota is too low. Please top up OpenAI billing or switch to another configured provider.',
+      details: raw
+    };
+  }
+
+  if (text.includes('timed out')) {
+    return {
+      provider,
+      code: 'TIMEOUT',
+      message: `${provider} request timed out. Please try again.`,
+      details: raw
+    };
+  }
+
+  if (provider === 'Anthropic' && !anthropic) {
+    return {
+      provider,
+      code: 'NOT_CONFIGURED',
+      message: 'Claude support is not configured. Missing ANTHROPIC_API_KEY.',
+      details: raw
     };
   }
 
   return {
     provider,
     code: 'PROVIDER_ERROR',
-    message: rawMessage
+    message: raw,
+    details: raw
   };
 }
 
@@ -226,7 +247,7 @@ Rules:
 }
 
 // ======================================================
-// HELPERS
+// GENERAL HELPERS
 // ======================================================
 function safeJsonParse(text) {
   try {
@@ -377,11 +398,49 @@ ${buildUserPrompt(userMessage, context)}
         (response.usage?.output_tokens || 0)
     };
   } catch (error) {
-    const friendly = getFriendlyProviderError(error, model);
+    const friendly = classifyError(error, model);
     const wrapped = new Error(friendly.message);
     wrapped.provider = friendly.provider;
     wrapped.code = friendly.code;
-    wrapped.originalMessage = stringifyError(error);
+    wrapped.details = friendly.details;
+    throw wrapped;
+  }
+}
+
+// ======================================================
+// OPENAI CHAT CALL
+// ======================================================
+async function callOpenAIChat({ model, persona, userMessage, context }) {
+  try {
+    const response = await withTimeout(
+      client.responses.create({
+        model,
+        max_output_tokens: 500,
+        input: [
+          {
+            role: 'system',
+            content: buildSystemPrompt(persona)
+          },
+          {
+            role: 'user',
+            content: buildUserPrompt(userMessage, context)
+          }
+        ]
+      }),
+      20000,
+      'OpenAI chat request'
+    );
+
+    return {
+      text: response.output_text || 'No response generated.',
+      tokenUsage: response.usage?.total_tokens || 0
+    };
+  } catch (error) {
+    const friendly = classifyError(error, model);
+    const wrapped = new Error(friendly.message);
+    wrapped.provider = friendly.provider;
+    wrapped.code = friendly.code;
+    wrapped.details = friendly.details;
     throw wrapped;
   }
 }
@@ -433,11 +492,11 @@ async function runRecordInsightAnalysis(body) {
 
     return normalizeInsightPayload(parsed, objectApiName);
   } catch (error) {
-    const friendly = getFriendlyProviderError(error, 'gpt-4.1-mini');
+    const friendly = classifyError(error, 'gpt-4.1-mini');
     const wrapped = new Error(friendly.message);
     wrapped.provider = friendly.provider;
     wrapped.code = friendly.code;
-    wrapped.originalMessage = stringifyError(error);
+    wrapped.details = friendly.details;
     throw wrapped;
   }
 }
@@ -457,7 +516,7 @@ app.post('/analyze', async (req, res) => {
       provider: error.provider || 'OpenAI',
       code: error.code || 'PROVIDER_ERROR',
       message: error.message,
-      details: error.originalMessage || error.message
+      details: error.details || error.message
     });
   }
 });
@@ -474,7 +533,7 @@ app.post('/api/v1/analyze', async (req, res) => {
       provider: error.provider || 'OpenAI',
       code: error.code || 'PROVIDER_ERROR',
       message: error.message,
-      details: error.originalMessage || error.message
+      details: error.details || error.message
     });
   }
 });
@@ -495,45 +554,59 @@ app.post('/api/v1/chat', async (req, res) => {
     let aiResult;
 
     if (model.startsWith('claude')) {
-      aiResult = await callClaudeChat({
+      try {
+        aiResult = await callClaudeChat({
+          model,
+          persona,
+          userMessage,
+          context
+        });
+      } catch (error) {
+        if (error.code === 'LOW_CREDIT') {
+          console.log('Claude unavailable due to low credit. Falling back to OpenAI.');
+
+          const fallbackResult = await callOpenAIChat({
+            model: 'gpt-4.1-mini',
+            persona,
+            userMessage,
+            context
+          });
+
+          aiResult = {
+            text:
+              '⚠️ Claude was unavailable due to low Anthropic credits, so this response was generated with OpenAI GPT-4.1 Mini.\n\n' +
+              fallbackResult.text,
+            tokenUsage: fallbackResult.tokenUsage
+          };
+
+          const citations = buildCitations(context);
+
+          return res.status(200).json({
+            response: aiResult.text,
+            model: 'gpt-4.1-mini',
+            fallbackFrom: model,
+            cost: 0,
+            tokenUsage: aiResult.tokenUsage,
+            confidence: 90,
+            suggestedQuestions: [
+              'Which opportunities are at risk?',
+              'What are the next best actions for the pipeline?',
+              'Who are the key contacts on this account?',
+              'Are there any contract renewal risks?'
+            ],
+            citations
+          });
+        }
+
+        throw error;
+      }
+    } else {
+      aiResult = await callOpenAIChat({
         model,
         persona,
         userMessage,
         context
       });
-    } else {
-      try {
-        const response = await withTimeout(
-          client.responses.create({
-            model,
-            max_output_tokens: 500,
-            input: [
-              {
-                role: 'system',
-                content: buildSystemPrompt(persona)
-              },
-              {
-                role: 'user',
-                content: buildUserPrompt(userMessage, context)
-              }
-            ]
-          }),
-          20000,
-          'OpenAI chat request'
-        );
-
-        aiResult = {
-          text: response.output_text || 'No response generated.',
-          tokenUsage: response.usage?.total_tokens || 0
-        };
-      } catch (error) {
-        const friendly = getFriendlyProviderError(error, model);
-        const wrapped = new Error(friendly.message);
-        wrapped.provider = friendly.provider;
-        wrapped.code = friendly.code;
-        wrapped.originalMessage = stringifyError(error);
-        throw wrapped;
-      }
     }
 
     const citations = buildCitations(context);
@@ -560,7 +633,7 @@ app.post('/api/v1/chat', async (req, res) => {
       provider: error.provider || getProviderFromModel(normalizeModelName(req.body?.model)),
       code: error.code || 'PROVIDER_ERROR',
       message: error.message,
-      details: error.originalMessage || error.message
+      details: error.details || error.message
     });
   }
 });
